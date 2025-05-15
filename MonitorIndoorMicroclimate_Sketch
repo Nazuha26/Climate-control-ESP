@@ -1,0 +1,165 @@
+/*********************************************************
+ *   Sketch for monitoring indoor microclimate parametrs
+ *********************************************************/
+
+/* ***************** LIBRARIES ***************** */
+#include <Arduino.h>
+#include <DHT.h>
+
+/* ***************** PIN SETUP ***************** */
+#define TRIG1 13  // East to West  (sensor 1)
+#define ECHO1 14
+#define TRIG2 27  // West to East  (sensor 2)
+#define ECHO2 26
+#define TRIG3 25  // North to South (sensor 3)
+#define ECHO3 33
+#define TRIG4 4   // South to North (sensor 4)
+#define ECHO4 5
+
+#define DHTPIN 15
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/* ***************** CONSTANTS ***************** */
+const float SENSOR_DISTANCE = 0.354;    // meters
+const int   NUM_SAMPLES   = 50;         // number of times to average the values
+const int   SAMPLE_DELAY  = 10;         // ms delay for averaging
+
+/* ***************** Globals vars ***************** */
+int  g_totalCycles  = 10;               // from Excel A5
+int  g_pauseSec     = 5;                // from Excel B5
+int  g_row          = 2;                // Excel row counter
+bool g_paramsReady  = false;
+bool g_stopped      = false;
+
+/* ***************** measure echo-time (mks) ***************** */
+inline unsigned long echoTime(uint8_t trig, uint8_t echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  return pulseIn(echo, HIGH, 30000);
+}
+
+/* ***** convert 8-point compass to column ***** */
+String dirToCol(const String& d) {
+  if (d == "N")  return "E";
+  if (d == "NE") return "F";
+  if (d == "E")  return "G";
+  if (d == "SE") return "H";
+  if (d == "S")  return "I";
+  if (d == "SW") return "J";
+  if (d == "W")  return "K";
+  if (d == "NW") return "L";
+  return "";
+}
+
+/* ***************** MAIN SETUP ***************** */
+void setup() {
+  Serial.begin(115200); // bods
+
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+  pinMode(TRIG3, OUTPUT); pinMode(ECHO3, INPUT);
+  pinMode(TRIG4, OUTPUT); pinMode(ECHO4, INPUT);
+
+  dht.begin();
+  Serial.println("CLEARRANGE,E,2,P,75");          // clear output range
+}
+
+/* ***************** MAIN LOOP ***************** */
+void loop() {
+
+  /* ***** Read cycle count and pause from Excel ***** */
+  if (!g_paramsReady) {
+    Serial.println("CELL,GET,A5"); delay(100);
+    g_totalCycles = Serial.readStringUntil('\n').toInt();
+    if (g_totalCycles <= 0) g_totalCycles = 10;
+
+    Serial.println("CELL,GET,B5"); delay(100);
+    g_pauseSec = Serial.readStringUntil('\n').toInt();
+    if (g_pauseSec <= 0) g_pauseSec = 5;
+
+    g_paramsReady = true;
+    return;                                   // wait next loop
+  }
+
+  /* ***** Stop when all cycles are done ***** */
+  static int done = 0;
+  if (g_stopped) return;
+  if (done >= g_totalCycles) {
+    Serial.println("CELL,SET,A11,The program is NOT running");
+    g_stopped = true;
+    return;
+  }
+
+  /* ***************** AVERAGE SENSORS DATA ***************** */
+  unsigned long sT1 = 0, sT2 = 0, sT3 = 0, sT4 = 0;
+  float         sTemp = 0.0, sHum = 0.0;
+
+  for (int i = 0; i < NUM_SAMPLES; ++i) {
+    sT1 += echoTime(TRIG1, ECHO1);
+    sT2 += echoTime(TRIG2, ECHO2);
+    sT3 += echoTime(TRIG3, ECHO3);
+    sT4 += echoTime(TRIG4, ECHO4);
+
+    sTemp += dht.readTemperature();
+    sHum  += dht.readHumidity();
+    delay(SAMPLE_DELAY);
+  }
+
+  float t1 = sT1 / (float)NUM_SAMPLES;
+  float t2 = sT2 / (float)NUM_SAMPLES;
+  float t3 = sT3 / (float)NUM_SAMPLES;
+  float t4 = sT4 / (float)NUM_SAMPLES;
+
+  /* ***************** Wind math ***************** */
+  float vs1 = SENSOR_DISTANCE / t1 * 1e6;      // m/s
+  float vs2 = SENSOR_DISTANCE / t2 * 1e6;
+  float vs3 = SENSOR_DISTANCE / t3 * 1e6;
+  float vs4 = SENSOR_DISTANCE / t4 * 1e6;
+
+  float vEW = (vs1 - vs2) / 2.0;
+  float vNS = (vs3 - vs4) / 2.0;
+
+  float speed = sqrt(vEW * vEW + vNS * vNS);   // wind speed
+
+  int deg = (int)(atan2(vEW, vNS) * 180.0 / PI);
+  if (deg < 0) deg += 360;
+
+  String dir;
+  switch (((deg + 22) / 45) % 8) {             // 8-points compass
+    case 0: dir = "N";  break;
+    case 1: dir = "NE"; break;
+    case 2: dir = "E";  break;
+    case 3: dir = "SE"; break;
+    case 4: dir = "S";  break;
+    case 5: dir = "SW"; break;
+    case 6: dir = "W";  break;
+    case 7: dir = "NW"; break;
+  }
+  String col = dirToCol(dir);
+
+  /* ***** Write wind speed to correct column ***** */
+  if (col != "") {
+    Serial.print("CELL,SET,"); Serial.print(col);
+    Serial.print(g_row); Serial.print(",");
+    Serial.println(speed, 2);
+  }
+
+  /* ***** Write tempr. and hum. ***** */
+  Serial.print("CELL,SET,O"); Serial.print(g_row); Serial.print(",");
+  Serial.println(sTemp / NUM_SAMPLES, 1);
+
+  Serial.print("CELL,SET,P"); Serial.print(g_row); Serial.print(",");
+  Serial.println(sHum  / NUM_SAMPLES, 1);
+
+  /* ***** Status message ***** */
+  int elapsed = (done + 1) * g_pauseSec;
+  Serial.print("CELL,SET,A11,The program is running for ");
+  Serial.print(elapsed);
+  Serial.println(" sec.");
+
+  ++g_row;
+  ++done;
+  delay(g_pauseSec * 1000UL);
+}
